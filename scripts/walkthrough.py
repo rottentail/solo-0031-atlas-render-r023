@@ -39,6 +39,12 @@ def tiny_png():
     return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 2, 2, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(b'\0' + bytes([240, 40, 80, 255] * 2) + b'\0' + bytes([40, 80, 240, 128] * 2))) + chunk(b'IEND', b'')
 
 
+def alt_png():
+    def chunk(tag, data):
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data))
+    return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 2, 2, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(b'\0' + bytes([10, 200, 60, 255] * 2) + b'\0' + bytes([200, 60, 10, 255] * 2))) + chunk(b'IEND', b'')
+
+
 class Demo:
     def __init__(self, binary, directory):
         self.binary = binary
@@ -102,6 +108,176 @@ class Demo:
         return self.call('POST', '/v1/jobs', {'snapshotId': snapshot['id'], 'scale': scale}, 202, {'Idempotency-Key': key})
 
 
+def image_doc(asset_ids):
+    layers = []
+    for index, asset_id in enumerate(asset_ids):
+        layers.append({'id': f'img-{index}', 'kind': 'image', 'width': 40, 'height': 40,
+                       'assetId': asset_id, 'opacity': 1,
+                       'transform': {'x': 10 + index * 50, 'y': 10, 'scaleX': 1, 'scaleY': 1, 'degrees': 0}})
+    return {'width': 320, 'height': 200, 'background': '#202830', 'layers': layers}
+
+
+def run_import_conflicts(demo):
+    """Preview -> confirm package import with same-name asset conflicts and races."""
+    tgt_png, pkg_png = tiny_png(), alt_png()
+    assert tgt_png != pkg_png
+
+    # Target environment already holds an asset id that the package will reuse,
+    # plus a frozen render that depends on the target bytes.
+    target_asset = demo.call('PUT', '/v1/assets/ribbon', tgt_png, 201)
+    doc = image_doc(['ribbon'])
+    demo.call('PUT', '/v1/scenes/emblem', {'name': '目标印记', 'expectedRevision': 1, 'document': doc})
+    frozen = demo.call('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': 2}, 201)
+    frozen_job = demo.wait(demo.submit(frozen, 'frozen-before-import')['id'])
+    frozen_png = demo.call('GET', '/v1/artifacts/' + frozen_job['artifactId'])
+    frozen_digest = hashlib.sha256(frozen_png).hexdigest()
+
+    # A separate server produces the exchange package carrying different bytes
+    # under the same asset id (and a brand-new asset id).
+    (demo.directory / 'other').mkdir()
+    other = Demo(demo.binary, demo.directory / 'other')
+    try:
+        other.call('PUT', '/v1/assets/ribbon', pkg_png, 201)
+        other.call('PUT', '/v1/assets/extra', tgt_png, 201)
+        other.call('PUT', '/v1/scenes/source',
+                   {'name': '来源印记', 'expectedRevision': 0, 'document': image_doc(['ribbon', 'extra'])})
+        src_snap = other.call('POST', '/v1/scenes/source/snapshots', {'expectedRevision': 1}, 201)
+        package = other.call('GET', '/v1/snapshots/' + src_snap['id'] + '/package')
+    finally:
+        other.stop()
+
+    def body(dest):
+        return {'name': '导入的印记', 'package': package}, dest
+
+    # 1) Preview is read-only and human understandable; repeating it changes nothing.
+    payload, _ = body('adopted-scene')
+    preview = demo.call('POST', '/v1/imports/adopted-scene/preview', payload)
+    assert preview['sceneStatus'] == 'free'
+    rows = {a['assetId']: a for a in preview['assets']}
+    assert rows['ribbon']['status'] == 'contentConflict'
+    assert rows['ribbon']['packageDigest'] == hashlib.sha256(pkg_png).hexdigest()
+    assert rows['ribbon']['targetDigest'] == target_asset['digest']
+    assert set(rows['ribbon']['allowed']) == {'keep', 'adopt'}
+    assert rows['extra']['status'] == 'new'
+    assert preview['summary'] == {'new': 1, 'identical': 0, 'contentConflict': 1, 'retiredConflict': 0}
+    assert preview['fingerprint']
+    demo.call('POST', '/v1/imports/adopted-scene/preview', payload)
+    demo.call('GET', '/v1/scenes/adopted-scene', status=404)
+
+    # 2) Legacy one-shot import now answers 409 with the preview attached.
+    err = demo.call('POST', '/v1/imports/adopted-scene', payload, 409)
+    assert err['code'] == 'conflict' and err['preview']['fingerprint'] == preview['fingerprint']
+    demo.call('GET', '/v1/scenes/adopted-scene', status=404)
+
+    # 3) A confirm without an explicit decision fails and lands nothing.
+    demo.call('POST', '/v1/imports/adopted-scene/confirm',
+              {'name': '导入的印记', 'fingerprint': preview['fingerprint'],
+               'package': package, 'decisions': {}}, 400)
+    demo.call('GET', '/v1/scenes/adopted-scene', status=404)
+    demo.call('POST', '/v1/imports/adopted-scene/confirm',
+              {'name': '导入的印记', 'fingerprint': preview['fingerprint'],
+               'package': package, 'decisions': {'ribbon': 'replace'}}, 400)
+
+    # 4) Adopt: package bytes enter under a fresh id; target asset keeps its id.
+    adopted = demo.call('POST', '/v1/imports/adopted-scene/confirm',
+                        {'name': '导入的印记', 'fingerprint': preview['fingerprint'],
+                         'package': package, 'decisions': {'ribbon': 'adopt'}}, 201)
+    new_id = adopted['remappedAssets']['ribbon']
+    assert new_id != 'ribbon' and new_id in adopted['addedAssets']
+    assert 'extra' in adopted['addedAssets']
+    imported_doc = adopted['scene']['document']
+    refs = imported_doc['layers'][0]['assetId'], imported_doc['layers'][1]['assetId']
+    assert refs == (new_id, 'extra')
+    # A re-preview against a fresh destination still sees the original target id
+    # holding the target bytes: adopt never overwrote or renamed it.
+    re_preview = demo.call('POST', '/v1/imports/another-scene/preview',
+                           {'name': '再次导入', 'package': package})
+    re_rows = {a['assetId']: a for a in re_preview['assets']}
+    assert re_rows['ribbon']['status'] == 'contentConflict'
+    assert re_rows['ribbon']['targetDigest'] == target_asset['digest']
+    assert new_id not in re_rows  # the package still names ribbon, not the remapped id
+
+    # Frozen render that predates the import is byte-for-byte untouched.
+    assert demo.call('GET', '/v1/artifacts/' + frozen_job['artifactId']) == frozen_png
+    assert hashlib.sha256(demo.call('GET', '/v1/artifacts/' + frozen_job['artifactId'])).hexdigest() == frozen_digest
+
+    # 5) Asset-axis race: asset changes after preview invalidate the fingerprint.
+    race_preview = demo.call('POST', '/v1/imports/race-asset/preview',
+                             {'name': '竞争场景', 'package': package})
+    demo.call('PUT', '/v1/assets/ribbon', alt_png(), 409)  # same id, new bytes still refused
+    demo.call('POST', '/v1/assets/ribbon/retire')
+    stale = demo.call('POST', '/v1/imports/race-asset/confirm',
+                      {'name': '竞争场景', 'fingerprint': race_preview['fingerprint'],
+                       'package': package, 'decisions': {'ribbon': 'adopt'}}, 409)
+    assert 'stale' in stale['error']
+    demo.call('GET', '/v1/scenes/race-asset', status=404)
+    # A refreshed preview turns the row into a retired conflict that forces adopt.
+    refreshed = demo.call('POST', '/v1/imports/race-asset/preview',
+                          {'name': '竞争场景', 'package': package})
+    retired_row = {a['assetId']: a for a in refreshed['assets']}['ribbon']
+    assert retired_row['status'] == 'retiredConflict' and retired_row['allowed'] == ['adopt']
+    assert retired_row['targetState'] == 'retired'
+    forced = demo.call('POST', '/v1/imports/race-asset/confirm',
+                       {'name': '竞争场景', 'fingerprint': refreshed['fingerprint'],
+                        'package': package, 'decisions': {'ribbon': 'adopt'}}, 201)
+    retired_new_id = forced['remappedAssets']['ribbon']
+    assert retired_new_id != 'ribbon'
+    # The retired target id stays retired; a later preview still reads it that way.
+    post_preview = demo.call('POST', '/v1/imports/race-asset-2/preview',
+                             {'name': '竞争场景二', 'package': package})
+    assert {a['assetId']: a for a in post_preview['assets']}['ribbon']['targetState'] == 'retired'
+    assert 'ribbon' not in forced['addedAssets'] and retired_new_id in forced['addedAssets']
+
+    # 6) Scene-axis race: the destination scene appearing after preview blocks the commit.
+    scene_preview = demo.call('POST', '/v1/imports/race-scene/preview',
+                              {'name': '竞争场景', 'package': package})
+    demo.call('PUT', '/v1/scenes/race-scene',
+              {'name': '占位', 'expectedRevision': 0, 'document': image_doc(['extra'])})
+    err = demo.call('POST', '/v1/imports/race-scene/confirm',
+                    {'name': '竞争场景', 'fingerprint': scene_preview['fingerprint'],
+                     'package': package, 'decisions': {'ribbon': 'adopt'}}, 409)
+    assert 'stale' in err['error']
+
+    # 7) A forged fingerprint is rejected even when nothing else changed.
+    demo.call('POST', '/v1/imports/forged/confirm',
+              {'name': '伪造', 'fingerprint': 'deadbeef', 'package': package,
+               'decisions': {'ribbon': 'adopt'}}, 409)
+    demo.call('GET', '/v1/scenes/forged', status=404)
+
+    # 8) Keep: preserve the target asset; the imported scene references its id.
+    # Build a conflicting package through a real export so digests are valid.
+    demo.call('PUT', '/v1/assets/kept', tgt_png, 201)
+    (demo.directory / 'keep-other').mkdir()
+    keep_other = Demo(demo.binary, demo.directory / 'keep-other')
+    try:
+        keep_other.call('PUT', '/v1/assets/kept', pkg_png, 201)
+        keep_other.call('PUT', '/v1/scenes/keep-source',
+                        {'name': '保留来源', 'expectedRevision': 0, 'document': image_doc(['kept'])})
+        keep_snap = keep_other.call('POST', '/v1/scenes/keep-source/snapshots',
+                                    {'expectedRevision': 1}, 201)
+        keep_pkg = keep_other.call('GET', '/v1/snapshots/' + keep_snap['id'] + '/package')
+    finally:
+        keep_other.stop()
+    keep_preview = demo.call('POST', '/v1/imports/kept-scene/preview',
+                             {'name': '保留场景', 'package': keep_pkg})
+    assert {a['assetId']: a['status'] for a in keep_preview['assets']}['kept'] == 'contentConflict'
+    kept = demo.call('POST', '/v1/imports/kept-scene/confirm',
+                     {'name': '保留场景', 'fingerprint': keep_preview['fingerprint'],
+                      'package': keep_pkg, 'decisions': {'kept': 'keep'}}, 201)
+    assert kept['scene']['document']['layers'][0]['assetId'] == 'kept'
+    assert 'kept' in kept['reusedAssets'] and 'kept' not in kept['addedAssets']
+    # Keeping the target leaves its bytes untouched; a fresh preview still reads
+    # the original target digest under that id.
+    keep_again = demo.call('POST', '/v1/imports/kept-scene-2/preview',
+                           {'name': '保留场景二', 'package': keep_pkg})
+    assert {a['assetId']: a for a in keep_again['assets']}['kept']['targetDigest'] == hashlib.sha256(tgt_png).hexdigest()
+
+    # The pre-existing frozen render remains unchanged after every operation.
+    assert hashlib.sha256(demo.call('GET', '/v1/artifacts/' + frozen_job['artifactId'])).hexdigest() == frozen_digest
+    return {'workflow': 'import-conflicts', 'adoptedAsset': new_id, 'retiredRemap': retired_new_id,
+            'frozenRenderDigest': frozen_digest, 'importedScenes': 4}
+
+
 def run(demo, workflow, out):
     d = sample()
     put = lambda doc, rev=0: demo.call('PUT', '/v1/scenes/emblem', {'name': '双色印记', 'expectedRevision': rev, 'document': doc})
@@ -140,6 +316,9 @@ def run(demo, workflow, out):
         corrupt = json.loads(json.dumps(package)); corrupt['snapshot']['document']['width'] += 1
         demo.call('POST', '/v1/imports/corrupt', {'name': '损坏包', 'package': corrupt}, 400)
         demo.call('GET', '/v1/scenes/corrupt', status=404)
+    if workflow == 'import-conflicts':
+        result = run_import_conflicts(demo)
+        return result
     if workflow in ('cancel-render', 'retry-render', 'recover-render'):
         heavy = sample(); heavy['width'] = 1500; heavy['height'] = 1500
         heavy['layers'] = [dict(heavy['layers'][0], id=f'sheet-{i}', width=1500, height=1500, transform={'scaleX': 1, 'scaleY': 1}) for i in range(16)]

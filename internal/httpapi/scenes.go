@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"atlas-render/internal/bundle"
 	"atlas-render/internal/model"
 	"io"
 	"net/http"
@@ -105,20 +104,4 @@ func (a API) exportPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, 200, v)
-}
-func (a API) importPackage(w http.ResponseWriter, r *http.Request) {
-	var b struct {
-		Name    string         `json:"name"`
-		Package bundle.Package `json:"package"`
-	}
-	if e := decode(w, r, &b); e != nil {
-		fail(w, e)
-		return
-	}
-	v, e := a.Service.Import(r.PathValue("id"), b.Name, b.Package)
-	if e != nil {
-		fail(w, e)
-		return
-	}
-	write(w, 201, v)
 }

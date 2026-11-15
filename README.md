@@ -22,6 +22,7 @@ python3 scripts/walkthrough.py --workflow cancel-render
 python3 scripts/walkthrough.py --workflow retry-render
 python3 scripts/walkthrough.py --workflow recover-render
 python3 scripts/walkthrough.py --workflow import-package
+python3 scripts/walkthrough.py --workflow import-conflicts
 python3 scripts/walkthrough.py --workflow compare-renders
 ```
 
@@ -35,6 +36,10 @@ python3 scripts/walkthrough.py --workflow compare-renders
 4. `GET /v1/jobs/{id}` 等待 `succeeded`，再读取 `GET /v1/artifacts/{artifactId}`。
 
 同一幂等键和同一请求返回原任务；同键不同请求返回 409。快照包含引用素材的字节，后续场景编辑或素材退役不改变它。撤回快照会阻止新工作，已接受的任务仍使用固定输入。任务取消和结果提交竞争同一个持久状态；终态完成后不可取消。
+
+## 交换包冲突预览与确认
+
+导入交换包遇到目标同名素材冲突时，先用 `POST /v1/imports/{id}/preview` 取得只读预览：每个包内素材标注 `new`、`identical`、`contentConflict` 或 `retiredConflict`，给出双方摘要、尺寸和允许决策，并返回锁定当前目标事实的 `fingerprint`。再用 `POST /v1/imports/{id}/confirm` 回传指纹和每个冲突素材的决策：`keep` 保留目标素材（导入文档引用原ID），`adopt` 把包内字节以新素材ID落地并重写文档引用，目标素材和任何冻结快照、历史渲染的ID与字节都不会被改动；退役素材只能 `adopt`。确认期间目标场景或素材若已变化，指纹失效并返回409，客户端需重新预览；任何失败都保持目标原样、不部分落地。一次性入口 `POST /v1/imports/{id}` 仍兼容：无冲突直接提交，冲突时409响应体内附带同样的预览。
 
 ## 范围与限制
 

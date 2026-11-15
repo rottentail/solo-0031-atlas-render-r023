@@ -300,6 +300,24 @@
       "verification": "python3 scripts/walkthrough.py --workflow import-package"
     },
     {
+      "id": "import-conflicts",
+      "name": "交换包同名冲突预览与确认",
+      "entry": "POST /v1/imports/{id}/preview + POST /v1/imports/{id}/confirm",
+      "success": "预览同名素材冲突并按保留目标或采用包内素材一次提交",
+      "failure": "过期预览、缺少或非法决策拒绝且目标保持原样，冻结渲染不被重命名牵动",
+      "module_ids": [
+        "httpapi",
+        "service",
+        "bundle",
+        "persist"
+      ],
+      "steps": [
+        "经公开HTTP入口完成领域转换",
+        "通过存储或渲染结果观察已提交事实"
+      ],
+      "verification": "python3 scripts/walkthrough.py --workflow import-conflicts"
+    },
+    {
       "id": "compare-renders",
       "name": "比较渲染结果",
       "entry": "POST /v1/compare",

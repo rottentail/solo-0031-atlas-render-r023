@@ -21,6 +21,15 @@ func write(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 func fail(w http.ResponseWriter, e error) {
+	var pe *service.PreviewConflictError
+	if errors.As(e, &pe) {
+		write(w, 409, map[string]any{
+			"code":    "conflict",
+			"error":   pe.Message,
+			"preview": pe.Preview,
+		})
+		return
+	}
 	var de *model.Error
 	if errors.As(e, &de) {
 		write(w, de.Status, map[string]string{"code": de.Code, "error": de.Message})
@@ -53,6 +62,8 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("POST /v1/snapshots/{id}/revoke", a.revoke)
 	m.HandleFunc("GET /v1/snapshots/{id}/package", a.exportPackage)
 	m.HandleFunc("POST /v1/imports/{id}", a.importPackage)
+	m.HandleFunc("POST /v1/imports/{id}/preview", a.importPreview)
+	m.HandleFunc("POST /v1/imports/{id}/confirm", a.importCommit)
 	m.HandleFunc("POST /v1/jobs", a.submit)
 	m.HandleFunc("GET /v1/jobs/{id}", a.getJob)
 	m.HandleFunc("POST /v1/jobs/{id}/cancel", a.cancel)

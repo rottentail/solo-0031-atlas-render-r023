@@ -61,6 +61,10 @@
       "command": "python3 scripts/walkthrough.py --workflow import-package"
     },
     {
+      "workflow_id": "import-conflicts",
+      "command": "python3 scripts/walkthrough.py --workflow import-conflicts"
+    },
+    {
       "workflow_id": "compare-renders",
       "command": "python3 scripts/walkthrough.py --workflow compare-renders"
     },
